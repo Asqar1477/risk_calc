@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Risk Menejment Kalkulyatori</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
+    body {
+      background: radial-gradient(circle at top left, #0f172a, #1e293b 70%);
+      color: #f1f5f9;
+      padding: 30px;
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 900px;
+      margin: auto;
+      background: #111827;
+      border-radius: 16px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+      padding: 40px 30px;
+    }
+    h1 {
+      text-align: center;
+      font-size: 2.7rem;
+      margin-bottom: 30px;
+      font-weight: 800;
+      background: linear-gradient(to right, #06b6d4, #3b82f6);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    label {
+      display: block;
+      margin-top: 20px;
+      margin-bottom: 6px;
+      font-weight: 600;
+      color: #e0f2fe;
+    }
+    input, select {
+      width: 100%;
+      padding: 12px;
+      border-radius: 10px;
+      border: none;
+      font-size: 1rem;
+      background-color: #334155;
+      color: #fff;
+      transition: background 0.3s ease;
+    }
+    input:focus, select:focus { background-color: #475569; outline: none; }
+    .tooltip { font-size: 0.85rem; color: #94a3b8; margin-top: 4px; }
+    .results {
+      margin-top: 40px;
+      background: #1e293b;
+      border-radius: 16px;
+      padding: 25px;
+      box-shadow: inset 0 0 10px #0f172a;
+    }
+    .result-line { margin-bottom: 14px; font-size: 1.05rem; }
+    .highlight { color: #4ade80; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📊 Risk Menejment Kalkulyatori</h1>
+    <form id="calc-form">
+      <label for="pair">📈 Valyuta jufti</label>
+      <select id="pair">
+        <option value="10" data-pip="10">EURUSD</option>
+        <option value="10" data-pip="10">GBPUSD</option>
+        <option value="10" data-pip="10">USDJPY</option>
+        <option value="10" data-pip="10">GBPJPY</option>
+        <option value="10" data-pip="10">AUDUSD</option>
+        <option value="10" data-pip="10">NZDUSD</option>
+        <option value="10" data-pip="10">USDCAD</option>
+        <option value="10" data-pip="10">USDCHF</option>
+        <option value="1" data-pip="1">XAUUSD (Oltin)</option>
+        <option value="0.1" data-pip="0.1">US30 (Dow Jones)</option>
+        <option value="0.1" data-pip="0.1">NAS100</option>
+        <option value="1" data-pip="1">BTCUSD</option>
+      </select>
+      <label for="accountSize">💼 Hisob hajmi ($)</label>
+      <input type="number" id="accountSize" value="5000" />
+      <label for="riskPercent">📉 Risk foizi (kunlik, %)</label>
+      <input type="number" id="riskPercent" step="0.1" value="1" />
+      <div class="tooltip">1% tavsiya etiladi — bu $5,000 hisobda $50 degani</div>
+      <label for="slPips">🛑 Stop Loss (pips)</label>
+      <input type="number" id="slPips" value="20" />
+      <label for="rrRatio">🎯 Risk/Reward nisbati</label>
+      <input type="number" id="rrRatio" step="0.1" value="2" />
+    </form>
+    <div class="results" id="results">
+      <div class="result-line">💰 <strong>Risk miqdori:</strong> <span class="highlight" id="riskAmount"></span> USD</div>
+      <div class="result-line">📐 <strong>Lot hajmi:</strong> <span class="highlight" id="lotSize"></span> lot</div>
+      <div class="result-line">🎯 <strong>Take Profit (TP):</strong> <span class="highlight" id="tpPips"></span> pips</div>
+      <div class="result-line">🛑 <strong>Stop Loss (SL):</strong> <span class="highlight" id="slPipsResult"></span> pips</div>
+      <div class="result-line">⚖️ <strong>Risk/Reward:</strong> 1:<span class="highlight" id="rrResult"></span></div>
+    </div>
+  </div>
+  <script>
+    function calculate() {
+      const pairSelect = document.getElementById("pair");
+      const pipValue = parseFloat(pairSelect.selectedOptions[0].getAttribute("data-pip"));
+      const accountSize = parseFloat(document.getElementById("accountSize").value);
+      const riskPercent = parseFloat(document.getElementById("riskPercent").value);
+      const slPips = parseFloat(document.getElementById("slPips").value);
+      const rrRatio = parseFloat(document.getElementById("rrRatio").value);
+      const riskAmount = (accountSize * riskPercent) / 100;
+      const lotSize = (riskAmount / (slPips * pipValue)).toFixed(2);
+      const tpPips = slPips * rrRatio;
+
+      document.getElementById("riskAmount").innerText = riskAmount.toFixed(2);
+      document.getElementById("lotSize").innerText = lotSize;
+      document.getElementById("tpPips").innerText = tpPips.toFixed(1);
+      document.getElementById("slPipsResult").innerText = slPips;
+      document.getElementById("rrResult").innerText = rrRatio;
+    }
+    document.querySelectorAll("input, select").forEach(input => {
+      input.addEventListener("input", calculate);
+    });
+    calculate();
+  </script>
+</body>
+</html>
+
