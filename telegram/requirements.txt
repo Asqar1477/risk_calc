@@ -1,0 +1,8 @@
+python-telegram-bot==21.6
+finnhub-python==2.4.19
+pandas==2.2.2
+numpy==1.26.4
+feedparser==6.0.11
+python-dotenv==1.0.1
+SQLAlchemy==2.0.32
+requests==2.32.3

@@ -1,0 +1,443 @@
+from __future__ import annotations
+import os, json, math, asyncio, sqlite3, time
+from collections import deque
+from typing import List, Dict, Tuple, Optional
+import requests
+from dotenv import load_dotenv
+from telegram.helpers import escape_markdown
+
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters,
+    ContextTypes
+)
+
+# =======================
+# Config & Constants
+# =======================
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TWELVE_KEY = os.getenv("TWELVE_API_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+DB_PATH = "bot.db"
+MAIN_BTNS = [
+    [KeyboardButton("📊 Signal olish"), KeyboardButton("🧮 Risk kalkulyator")],
+    [KeyboardButton("ℹ️ Bot maqsadi"), KeyboardButton("👥 Foydalanuvchilar")],
+    [KeyboardButton("📣 Broadcast"),]
+]
+BACK_BTNS = [[KeyboardButton("🔙 Bosh menyu")]]
+
+MAIN_KB = ReplyKeyboardMarkup(MAIN_BTNS, resize_keyboard=True)
+BACK_KB = ReplyKeyboardMarkup(BACK_BTNS, resize_keyboard=True)
+
+# Instruments (Forex + Crypto + Indices + Stocks)
+PAIRS: List[str] = [
+    # Forex Majors
+    "XAUUSD","EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","NZDUSD","EURJPY","GBPJPY","AUDJPY","CHFJPY",
+    # Crypto Majors
+    "BTCUSD","ETHUSD","XRPUSD","LTCUSD","ADAUSD","SOLUSD","BNBUSD","DOGEUSD",
+    # Indices (common tickers; TwelveData mapping may vary by broker)
+    "NAS100","SPX500","US30","GER30","JPN225",
+    # US Stocks
+    "AAPL","TSLA","MSFT","GOOGL","AMZN","META","NVDA"
+]
+
+# MTF intervals for Twelve Data
+INTERVALS = ["5min", "15min", "1h", "4h"]
+OUTPUTSIZE = 300      # enough bars for EMA200 & ATR
+CONCURRENCY = 5       # avoid rate-limit
+
+# =======================
+# DB helpers
+# =======================
+def init_db():
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS users(
+            chat_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            username TEXT,
+            created_at INTEGER
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS sent_messages(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            msg TEXT,
+            sent_at INTEGER
+        )""")
+        con.commit()
+
+def save_user(chat_id:int, first_name:str, username:str|None):
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("INSERT OR IGNORE INTO users(chat_id, first_name, username, created_at) VALUES(?,?,?,?)",
+                    (chat_id, first_name, username or "", int(time.time())))
+        con.commit()
+
+def count_users()->int:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        (cnt,) = cur.fetchone()
+        return int(cnt or 0)
+
+# =======================
+# Indicator calculations
+# =======================
+def ema(values: List[float], period: int) -> List[float]:
+    k = 2 / (period + 1)
+    out = []
+    ema_prev = sum(values[:period]) / period
+    out = [None]*(period-1) + [ema_prev]
+    for v in values[period:]:
+        ema_prev = v*k + ema_prev*(1-k)
+        out.append(ema_prev)
+    return out
+
+def rsi(values: List[float], period: int = 14) -> List[float]:
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        change = values[i] - values[i-1]
+        gains.append(max(change, 0.0))
+        losses.append(abs(min(change, 0.0)))
+    if len(gains) < period: return [None]*len(values)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsi_vals = [None]*(period)
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain*(period-1) + gains[i]) / period
+        avg_loss = (avg_loss*(period-1) + losses[i]) / period
+        rs = (avg_gain / avg_loss) if avg_loss != 0 else 9999
+        rsi_vals.append(100 - (100/(1+rs)))
+    # align to price length
+    return [None] + rsi_vals
+
+def atr(high: List[float], low: List[float], close: List[float], period: int = 14) -> List[float]:
+    trs = []
+    for i in range(1, len(close)):
+        tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
+        trs.append(tr)
+    if len(trs) < period: return [None]*len(close)
+    atr_vals = []
+    atr_prev = sum(trs[:period]) / period
+    atr_vals = [None]*period + [atr_prev]
+    for tr in trs[period:]:
+        atr_prev = (atr_prev*(period-1) + tr)/period
+        atr_vals.append(atr_prev)
+    return [None] + atr_vals  # align
+
+# =======================
+# Twelve Data client
+# =======================
+def map_symbol(sym: str) -> str:
+    # Best-effort mapping (TwelveData often accepts raw, but some indices/crypto need slashes)
+    crypto_map = {"BTCUSD":"BTC/USD","ETHUSD":"ETH/USD","XRPUSD":"XRP/USD","LTCUSD":"LTC/USD","ADAUSD":"ADA/USD",
+                  "SOLUSD":"SOL/USD","BNBUSD":"BNB/USD","DOGEUSD":"DOGE/USD"}
+    index_map = {"NAS100":"NDX","SPX500":"SPX","US30":"DJI","GER30":"GDAXI","JPN225":"N225"}
+    return crypto_map.get(sym, index_map.get(sym, sym))
+
+def fetch_series(symbol: str, interval: str) -> Optional[Dict]:
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": map_symbol(symbol),
+        "interval": interval,
+        "outputsize": OUTPUTSIZE,
+        "format": "JSON",
+        "apikey": TWELVE_KEY,
+        "order": "asc"
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if "values" in data:
+            return data
+        return None
+    except Exception:
+        return None
+
+async def fetch_series_async(symbol: str, interval: str, sem: asyncio.Semaphore):
+    async with sem:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, fetch_series, symbol, interval)
+
+# =======================
+# ICT-lite + MTF Scoring
+# =======================
+def analyze_one_tf(values: List[Dict[str,str]]) -> Dict[str, float|str]:
+    # values: oldest -> newest
+    closes = [float(v["close"]) for v in values]
+    highs  = [float(v["high"])  for v in values]
+    lows   = [float(v["low"])   for v in values]
+
+    if len(closes) < 220:  # need enough bars
+        return {"score": -999, "bias": "N/A"}
+
+    ema20  = ema(closes, 20)
+    ema50  = ema(closes, 50)
+    ema200 = ema(closes, 200)
+    rsi14  = rsi(closes, 14)
+    atr14  = atr(highs, lows, closes, 14)
+
+    last = -1
+    bias_up = ema20[last] and ema50[last] and ema200[last] and ema20[last] > ema50[last] > ema200[last]
+    bias_dn = ema20[last] and ema50[last] and ema200[last] and ema20[last] < ema50[last] < ema200[last]
+    bias = "UP" if bias_up else ("DOWN" if bias_dn else "RANGE")
+
+    # Momentum filter
+    mom_good = 40 <= (rsi14[last] or 50) <= 60
+    if bias == "UP": mom_good = (rsi14[last] or 50) >= 50
+    if bias == "DOWN": mom_good = (rsi14[last] or 50) <= 50
+
+    # Simple BOS/CHOCH-lite: compare last swing highs/lows
+    def last_swings(arr: List[float], w=3)->Tuple[int,int]:
+        # very light pivot detection
+        hi_idx=lo_idx=None
+        for i in range(w, len(arr)-w):
+            if all(arr[i]>arr[i-j] for j in range(1,w+1)) and all(arr[i]>arr[i+j] for j in range(1,w+1)):
+                hi_idx = i
+            if all(arr[i]<arr[i-j] for j in range(1,w+1)) and all(arr[i]<arr[i+j] for j in range(1,w+1)):
+                lo_idx = i
+        return (hi_idx or len(arr)-w-1, lo_idx or len(arr)-w-1)
+
+    hi_idx, lo_idx = last_swings(closes, w=3)
+    bos_up = closes[last] > closes[hi_idx]
+    bos_dn = closes[last] < closes[lo_idx]
+
+    # Liquidity sweep (last high/low swept then revert)
+    sweep_up = highs[last] > highs[hi_idx] and closes[last] < highs[hi_idx]
+    sweep_dn = lows[last]  < lows[lo_idx]  and closes[last] > lows[lo_idx]
+
+    # FVG-lite: gap between previous high/low and current low/high
+    fvg_up = lows[last] > highs[last-2]  # simple 3-candle model
+    fvg_dn = highs[last] < lows[last-2]
+
+    # Score
+    score = 0
+    if bias == "UP": score += 2
+    if bias == "DOWN": score += 2
+    if mom_good: score += 1
+    if bos_up or bos_dn: score += 2
+    if sweep_up or sweep_dn: score += 1
+    if fvg_up or fvg_dn: score += 1
+
+    return {
+        "score": float(score),
+        "bias": bias,
+        "rsi": float(rsi14[last] or 50),
+        "atr": float(atr14[last] or 0.0)
+    }
+
+def combine_mtf(results: Dict[str, Dict]) -> Tuple[float,str]:
+    # weight higher TF more
+    weights = {"5min":1.0, "15min":1.2, "1h":1.8, "4h":2.2}
+    total, wsum = 0.0, 0.0
+    up, dn = 0, 0
+    for tf, r in results.items():
+        s = r.get("score", -999)
+        if s < -900:  # invalid
+            continue
+        total += s * weights.get(tf,1.0)
+        wsum += weights.get(tf,1.0)
+        b = r.get("bias","RANGE")
+        up += (b=="UP")
+        dn += (b=="DOWN")
+    bias = "UP" if up>dn and up>=2 else ("DOWN" if dn>up and dn>=2 else "RANGE")
+    return (round(total/wsum,2) if wsum>0 else -999, bias)
+
+# =======================
+# Signal Engine
+# =======================
+async def analyze_symbol(symbol: str) -> Optional[Dict]:
+    sem = analyze_symbol.sem
+    per_tf = {}
+    for tf in INTERVALS:
+        data = await fetch_series_async(symbol, tf, sem)
+        if not data or "values" not in data:
+            per_tf[tf] = {"score": -999, "bias":"N/A"}
+            continue
+        per_tf[tf] = analyze_one_tf(data["values"])
+    score, bias = combine_mtf(per_tf)
+    return {"symbol": symbol, "score": score, "bias": bias, "mtf": per_tf}
+analyze_symbol.sem = asyncio.Semaphore(CONCURRENCY)
+
+async def top_signals() -> List[Dict]:
+    tasks = [analyze_symbol(sym) for sym in PAIRS]
+    results = await asyncio.gather(*tasks)
+    valid = [r for r in results if r and r["score"]>-900]
+    valid.sort(key=lambda x: x["score"], reverse=True)
+    return valid[:10]  # eng yaxshi 10 ta
+
+# =======================
+# Text blocks
+# =======================
+DESC = (
+    "🧠 *Bot maqsadi*: Forex/Crypto/Indeks/Aksiyalar bo‘yicha MTF + ICT-lite tahlil asosida "
+    "eng yaxshi imkoniyatlarni topishga yordam beradi.\n\n"
+    "📐 *Strategiya*: EMA(20/50/200), RSI(14), ATR(14), BOS/CHOCH-lite, liquidity sweep va FVG-lite. "
+    "5m/15m/1h/4h vaznlab yagona skor beradi.\n\n"
+    "⚠️ *Ogohlantirish*: Bu moliyaviy maslahat emas. Xavfni o‘zingiz boshqaring."
+)
+
+# Orqaga qaytish klaviaturasi
+BACK_KB = ReplyKeyboardMarkup(
+    [["🔙 Bosh menyu"]],
+    resize_keyboard=True
+)
+
+# Yordam matni
+HELP_RISK = (
+    "🧮 Risk kalkulyator\n"
+    "Format: /risk balans risk% stop_pips [pip_value]\n"
+    "Misol: /risk 1000 1 30 → pip_value=10$ (default)\n"
+    "Formulasi: lot = (balans × risk%) / (stop_pips × pip_value)"
+)
+
+# =======================
+# Handlers
+# =======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    save_user(u.id, u.first_name or "", u.username)
+    await update.message.reply_text(
+        "Assalomu alaykum! Men Forex/Crypto signallar botiman. Kerakli bo‘limni tanlang 👇",
+        reply_markup=MAIN_KB
+    )
+
+async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bosh menyu 👇", reply_markup=MAIN_KB)
+
+async def description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_markdown(DESC, reply_markup=BACK_KB)
+
+async def users_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cnt = count_users()
+    await update.message.reply_text(f"👥 Foydalanuvchilar: {cnt}", reply_markup=BACK_KB)
+
+async def risk_calc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "🧮 Risk kalkulyator":
+        await update.message.reply_text(HELP_RISK, reply_markup=BACK_KB)
+        return
+
+    try:
+        parts = text.split()
+        if parts[0].lower() != "/risk":
+            await update.message.reply_text(HELP_RISK, reply_markup=BACK_KB)
+            return
+
+        bal = float(parts[1])
+        riskp = float(parts[2])
+        stop = float(parts[3])
+        pip_val = float(parts[4]) if len(parts) >= 5 else 10.0
+
+        lot = (bal * (riskp / 100.0)) / (stop * pip_val)
+
+        # Matnni xato chiqmasligi uchun Markdown belgilarini qochiramiz
+        msg = escape_markdown(
+            f"💼 Balans: {bal}\n"
+            f"⚠️ Risk: {riskp}%\n"
+            f"⛔️ Stop: {stop} pips\n"
+            f"💵 Pip qiymati: ${pip_val}\n\n"
+            f"📦 Lot hajmi: {lot:.2f}",
+            version=2
+        )
+
+        await update.message.reply_text(msg, parse_mode="MarkdownV2", reply_markup=BACK_KB)
+
+    except Exception:
+        await update.message.reply_text(HELP_RISK, reply_markup=BACK_KB)
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        await update.message.reply_text("❌ Bu bo‘lim faqat admin uchun.", reply_markup=BACK_KB)
+        return
+    # format: /broadcast xabar matni...
+    text = update.message.text
+    if text == "📣 Broadcast":
+        await update.message.reply_text("Admin: /broadcast xabar_matni", reply_markup=BACK_KB)
+        return
+    if not text.startswith("/broadcast"):
+        await update.message.reply_text("Admin: /broadcast xabar_matni", reply_markup=BACK_KB); return
+    msg = text[len("/broadcast"):].strip()
+    if not msg:
+        await update.message.reply_text("Xabar matnini kiriting: /broadcast Salom hamma!", reply_markup=BACK_KB); return
+
+    sent = 0
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("SELECT chat_id FROM users")
+        rows = cur.fetchall()
+    for (cid,) in rows:
+        try:
+            await context.bot.send_message(cid, f"📣 {msg}")
+            sent += 1
+        except Exception:
+            pass
+    await update.message.reply_text(f"Yuborildi: {sent} ta foydalanuvchiga ✅", reply_markup=BACK_KB)
+
+async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Analyzing MTF + ICT-lite... (10 ta eng yaxshi natija)", reply_markup=BACK_KB)
+    try:
+        top = await top_signals()
+        if not top:
+            await update.message.reply_text("Hech narsa topilmadi. Keyinroq urinib ko‘ring.", reply_markup=BACK_KB)
+            return
+        lines = []
+        for i, item in enumerate(top, start=1):
+            sym = item["symbol"]; sc = item["score"]; b = item["bias"]
+            m = item["mtf"]
+            tf_str = " / ".join(f"{tf}:{m[tf]['bias']}" for tf in INTERVALS)
+            # Simple entry/SL/TP hint with ATR
+            atr_1h = m["1h"].get("atr", 0.0) or 0.0
+            rr1, rr2 = 1.5, 2.0
+            lines.append(
+                f"{i}) *{sym}* — skor: *{sc}*, bias: *{b}*\n"
+                f"MTF: {tf_str}\n"
+                f"📌 ATR(1h): {atr_1h:.2f}  | TP1 {rr1}R, TP2 {rr2}R\n"
+            )
+        await update.message.reply_markdown("\n".join(lines), reply_markup=BACK_KB)
+    except Exception as e:
+        await update.message.reply_text("Xatolik yuz berdi, keyinroq urinib ko‘ring.", reply_markup=BACK_KB)
+
+# Router by text buttons
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    if txt == "📊 Signal olish":  return await signals(update, context)
+    if txt == "🧮 Risk kalkulyator": return await update.message.reply_markdown(HELP_RISK, reply_markup=BACK_KB)
+    if txt == "ℹ️ Bot maqsadi":  return await description(update, context)
+    if txt == "👥 Foydalanuvchilar": return await users_count(update, context)
+    if txt == "📣 Broadcast": return await broadcast(update, context)
+    if txt == "🔙 Bosh menyu": return await back_to_menu(update, context)
+    # fallbacks
+    if txt.startswith("/risk"): return await risk_calc(update, context)
+    if txt.startswith("/broadcast"): return await broadcast(update, context)
+    return await update.message.reply_text("Menyu tugmalaridan foydalaning 👇", reply_markup=MAIN_KB)
+
+# =======================
+# Main
+# =======================
+def main():
+    if not BOT_TOKEN or not TWELVE_KEY:
+        raise RuntimeError("BOT_TOKEN va TWELVE_API_KEY .env faylida kerak")
+
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("risk", risk_calc))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+
+    print("Bot running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped.")
